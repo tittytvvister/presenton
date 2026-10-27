@@ -41,6 +41,7 @@ from models.presentation_with_slides import (
     PresentationWithSlides,
 )
 from services.documents_loader import DocumentsLoader
+from services.provider_settings import get_provider_settings
 from services.chat.slide_ui_helpers import _normalize_generated_image_fit
 from services.temp_file_service import TEMP_FILE_SERVICE
 from services.webhook_service import WebhookService
@@ -342,6 +343,16 @@ def _presentation_response_data(presentation: PresentationModel) -> dict:
     data = presentation.model_dump(exclude={"layout", "structure"})
     data["type"] = (
         "smart" if presentation.generation_mode == "smart" else "standard"
+    )
+    # Blank decks have no saved generation setup, even after slide edits.
+    data["can_regenerate"] = (
+        bool(
+            presentation.content.strip()
+            or presentation.file_paths
+            or presentation.community_design_ids
+        )
+        if presentation.generation_mode == "smart"
+        else bool(presentation.outlines and presentation.structure and presentation.layout)
     )
     return data
 
@@ -1598,6 +1609,33 @@ async def duplicate_presentation(
         **_presentation_response_data(new_presentation),
         slides=new_slides,
     )
+
+
+@PRESENTATION_ROUTER.post("/{id}/regenerate", status_code=204)
+async def regenerate_smart_presentation(
+    id: uuid.UUID, sql_session: AsyncSession = Depends(get_async_session)
+):
+    presentation = await sql_session.get(PresentationModel, id)
+    if not presentation:
+        raise HTTPException(404, "Presentation not found")
+    settings = await get_provider_settings(sql_session)
+    if settings.get("LLM") == "presenton":
+        raise HTTPException(400, "Presenton Cloud does not support regeneration")
+    if (
+        presentation.generation_mode != "smart"
+        or not _presentation_response_data(presentation)["can_regenerate"]
+    ):
+        raise HTTPException(400, "A generated Smart presentation is required")
+
+    # Reset only on an explicit regeneration request. SSE reconnects must
+    # continue using saved checkpoints instead of restarting generation.
+    await sql_session.execute(
+        delete(SlideModel).where(
+            SlideModel.presentation == id,
+            SlideModel.owner_id == get_current_owner_id(),
+        )
+    )
+    await sql_session.commit()
 
 
 @PRESENTATION_ROUTER.post("/{id}/export", response_model=PresentationPathAndEditPath)
@@ -3251,9 +3289,11 @@ async def check_async_presentation_generation_status(
         raise HTTPException(
             status_code=404, detail="No presentation generation task found"
         )
-    response = status.model_copy(deep=True)
-    if response.data:
-        response.data = absolute_mcp_result_links(request, response.data)
+    # Return the row's field values as a plain dict (no SQLAlchemy instance
+    # state), like check_async_task_status; response_model still validates it.
+    response = status.model_dump()
+    if response.get("data"):
+        response["data"] = absolute_mcp_result_links(request, response["data"])
     return response
 
 
